@@ -1,0 +1,35 @@
+# Copy into .github/workflows/accord-worker.yml in a PRIVATE repository you own.
+# Enable only after the app is deployed and both secrets are configured.
+name: Accord durable worker
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 * * * *'
+permissions: {}
+concurrency:
+  group: accord-worker
+  cancel-in-progress: false
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Check due reviews and deliver durable work
+        env:
+          ACCORD_BASE_URL: ${{ secrets.ACCORD_BASE_URL }}
+          ACCORD_WORKER_SECRET: ${{ secrets.ACCORD_WORKER_SECRET }}
+        run: |
+          python3 - <<'PY'
+          import os, urllib.request, urllib.parse
+          base = os.environ['ACCORD_BASE_URL'].rstrip('/')
+          parsed = urllib.parse.urlparse(base)
+          if parsed.scheme != 'https' or not parsed.hostname or parsed.path or parsed.query or parsed.fragment or parsed.username:
+              raise SystemExit('Configure ACCORD_BASE_URL as the HTTPS application origin')
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, *args, **kwargs):
+                  return None
+          request = urllib.request.Request(base + '/api/internal/worker', data=b'', method='POST',
+              headers={'Authorization': 'Bearer ' + os.environ['ACCORD_WORKER_SECRET']})
+          with urllib.request.build_opener(NoRedirect).open(request, timeout=45) as response:
+              print('Worker check completed:', response.status)
+          PY
