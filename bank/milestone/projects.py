@@ -1,4 +1,4 @@
-"""Agreements and full-budget reservation. No public money-creation endpoint."""
+"""Agreements and full-budget reservation from authoritative wallet funds."""
 
 from typing import Annotated
 from uuid import UUID
@@ -23,6 +23,7 @@ class ProjectDraft(Command):
     title: Short
     freelancer_id: UUID
     milestones: Annotated[list[MilestoneDraft], Field(min_length=1, max_length=10)]
+    accept_on_create: Annotated[bool, Field(strict=True)] = False
 
 
 class ProjectVersion(Command):
@@ -43,7 +44,10 @@ def register(app, cfg, actor, role, command_result):
         with connect(cfg["app_dsn"]) as c:
             return result(
                 c.execute(
-                    "SELECT u.id,u.display_name FROM users u WHERE role='FREELANCER' AND active AND EXISTS(SELECT 1 FROM beneficiaries b WHERE b.owner_user_id=u.id AND b.active) ORDER BY u.id"
+                    """SELECT u.id,u.display_name FROM users u WHERE role='FREELANCER' AND active
+                    AND u.is_demo=%s AND (u.is_demo OR EXISTS(
+                      SELECT 1 FROM projects p WHERE p.client_id=%s AND p.freelancer_id=u.id)) ORDER BY u.id""",
+                    (a["is_demo"], a["id"]),
                 ).fetchall()
             )
 
@@ -54,15 +58,18 @@ def register(app, cfg, actor, role, command_result):
 
             def perform():
                 person = c.execute(
-                    "SELECT id FROM users WHERE id=%s AND role='FREELANCER' AND active", (body.freelancer_id,)
+                    "SELECT id FROM users WHERE id=%s AND role='FREELANCER' AND active AND is_demo=%s",
+                    (body.freelancer_id, a["is_demo"]),
                 ).fetchone()
                 beneficiary = c.execute(
-                    "SELECT id FROM beneficiaries WHERE owner_user_id=%s AND active ORDER BY id LIMIT 1",
+                    "SELECT id FROM beneficiaries WHERE owner_user_id=%s ORDER BY active DESC,id LIMIT 1",
                     (body.freelancer_id,),
                 ).fetchone()
                 wallet = c.execute("SELECT id FROM wallets WHERE owner_user_id=%s", (a["id"],)).fetchone()
                 if not person or not beneficiary or not wallet:
-                    conflict("Existing synthetic freelancer, beneficiary and client wallet are required.")
+                    conflict(
+                        "Use the account ID shared by a freelancer in the same personal or demo workspace."
+                    )
                 pid, gid = identifier(), identifier()
                 p = c.execute(
                     "INSERT INTO projects(id,client_id,freelancer_id,beneficiary_id,title,total_minor,currency,status) VALUES(%s,%s,%s,%s,%s,%s,'PKR','DRAFT') RETURNING *",
@@ -75,7 +82,7 @@ def register(app, cfg, actor, role, command_result):
                         sum(m.amount_minor for m in body.milestones),
                     ),
                 ).fetchone()
-                terms = body.model_dump(mode="json") | dict(
+                terms = body.model_dump(mode="json", exclude={"accept_on_create"}) | dict(
                     policy=POLICY,
                     review_seconds=604800,
                     client_id=str(a["id"]),
@@ -99,7 +106,23 @@ def register(app, cfg, actor, role, command_result):
                     request.state.correlation,
                     "Immutable draft terms created; both parties must accept before funding.",
                 )
-                return domain.project_view(c, p | dict(agreement_id=gid))
+                if body.accept_on_create:
+                    c.execute(
+                        "INSERT INTO agreement_acceptances(agreement_id,user_id,accepted_hash) VALUES(%s,%s,%s)",
+                        (gid, a["id"], digest(terms)),
+                    )
+                    c.execute("UPDATE projects SET version=version+1 WHERE id=%s", (pid,))
+                    audit(
+                        c,
+                        a["id"],
+                        "AGREEMENT_ACCEPTED",
+                        pid,
+                        request.state.correlation,
+                        "Client reviewed and accepted immutable terms when sending: " + digest(terms),
+                    )
+                return domain.project_view(
+                    c, p | dict(agreement_id=gid, version=2 if body.accept_on_create else 1)
+                )
 
             status, value, replay = idempotent(
                 c, a["id"], "create-project", key, body.model_dump(mode="json"), 201, perform
@@ -111,9 +134,26 @@ def register(app, cfg, actor, role, command_result):
         with connect(cfg["app_dsn"]) as c:
             p = domain.visible_project(c, a, project_id)
             g = c.execute("SELECT * FROM project_agreements WHERE id=%s", (p["agreement_id"],)).fetchone()
+            blockers = []
+            for person in c.execute(
+                """SELECT u.id,u.active,u.control_allowed,u.is_demo,s.state FROM users u
+                LEFT JOIN sandbox_setups s ON s.user_id=u.id WHERE u.id IN (%s,%s) ORDER BY u.role""",
+                (p["client_id"], p["freelancer_id"]),
+            ):
+                label = "Client" if person["id"] == p["client_id"] else "Freelancer"
+                if not person["is_demo"] and person["state"] != "READY":
+                    blockers.append(label + " needs to finish sandbox setup.")
+                elif not person["active"] or not person["control_allowed"]:
+                    blockers.append(label + " has a control hold requiring operations review.")
+            beneficiary = c.execute(
+                "SELECT active FROM beneficiaries WHERE id=%s", (p["beneficiary_id"],)
+            ).fetchone()
+            if not beneficiary["active"] and not any("Freelancer" in b for b in blockers):
+                blockers.append("The payout destination requires operations review.")
             return result(
                 g
                 | dict(
+                    funding_blockers=blockers,
                     project_version=p["version"],
                     acceptances=c.execute(
                         "SELECT user_id,accepted_at FROM agreement_acceptances WHERE agreement_id=%s",

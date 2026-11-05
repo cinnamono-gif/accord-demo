@@ -29,6 +29,7 @@ def config():
         "cron_secret",
         "demo_password",
         "public_demo",
+        "sandbox_setup_enabled",
     ):
         if os.environ.get(key.upper()):
             values[key] = os.environ[key.upper()]

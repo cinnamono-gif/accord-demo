@@ -20,6 +20,10 @@ def install(app):
                 )
         response = await call_next(request)
         response.headers["X-Correlation-ID"] = request.state.correlation
+        if request.url.path.startswith("/api/"):
+            response.headers["Cache-Control"] = "no-store"
+        if response.status_code == 429:
+            response.headers["Retry-After"] = "60"
         return response
 
     @app.exception_handler(Problem)
