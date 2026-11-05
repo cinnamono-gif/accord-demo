@@ -6,6 +6,8 @@ from fastapi import Depends, FastAPI, Header, Request
 from milestone.common import Problem, config, connect, digest, identifier, jsonable
 from milestone.http_support import install, result
 from milestone.models import ReconciliationCommand, TransferCommand, ReturnCommand
+from milestone.sandbox import BankSetup, enabled
+from psycopg.errors import NoDataFound
 
 
 def transfer_view(row):
@@ -96,6 +98,20 @@ def create_app(settings=None):
                         (body.reference, account, delta),
                     )
         return result(transfer_view(row), 201)
+
+    @app.post("/bank/v1/sandbox/accounts", dependencies=[Depends(service)], tags=["sandbox"])
+    def sandbox_account(body: BankSetup, request: Request):
+        if not enabled(cfg):
+            raise Problem(403, "SANDBOX_DISABLED", "Synthetic onboarding is disabled.")
+        try:
+            with connect(cfg["bank_dsn"]) as c:
+                receipt = c.execute(
+                    "SELECT provision_sandbox(%s,%s,%s) AS receipt",
+                    (body.user_id, body.role, request.state.correlation),
+                ).fetchone()["receipt"]
+        except NoDataFound:
+            raise Problem(409, "SANDBOX_CAPACITY", "Synthetic account capacity reached.") from None
+        return result(receipt)
 
     @app.get("/bank/v1/transfers/{reference}", dependencies=[Depends(service)])
     def enquiry(reference: UUID):

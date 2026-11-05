@@ -1,18 +1,29 @@
-from datetime import timedelta
 from typing import Annotated
 from uuid import UUID
 import jwt
+from psycopg.errors import UniqueViolation
 from fastapi import Depends, FastAPI, Header, Query, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from starlette.background import BackgroundTask
 from milestone import domain
-from milestone.common import Problem, audit, config, connect, idempotent, identifier, now, verify_password
+from milestone import identity
+from milestone.common import (
+    Problem,
+    audit,
+    config,
+    connect,
+    idempotent,
+    identifier,
+    hash_password,
+    verify_password,
+)
 from milestone.http_support import install, page, result
 from milestone.models import (
     ApprovalCommand,
     ReconciliationCommand,
     SubmissionCommand,
     TokenRequest,
+    RegistrationRequest,
     DisputeCommand,
     RevisionCommand,
 )
@@ -21,7 +32,7 @@ Bearer = HTTPBearer(auto_error=False)
 Key = Annotated[str, Header(alias="Idempotency-Key", min_length=8, max_length=128)]
 
 
-def create_app(settings=None, *, after_command=None):
+def create_app(settings=None, *, after_command=None, sandbox_bank=None):
     cfg = settings or config()
     app = FastAPI(
         title="Accord — governed milestone payments",
@@ -37,7 +48,7 @@ def create_app(settings=None, *, after_command=None):
             response.background = BackgroundTask(after_command)
         return response
 
-    def actor(request: Request, credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(Bearer)]):
+    def authenticate(c, request, credentials):
         if not credentials:
             raise Problem(401, "UNAUTHENTICATED", "Sign in to continue.")
         try:
@@ -47,23 +58,45 @@ def create_app(settings=None, *, after_command=None):
                 algorithms=["HS256"],
                 audience="milestone",
                 issuer="milestone-local",
-                options={"require": ["exp", "sub", "iat", "aud", "iss"]},
+                options={"require": ["exp", "sub", "iat", "aud", "iss", "jti"]},
             )
             user_id = UUID(token["sub"])
-        except (jwt.PyJWTError, ValueError, KeyError):
+            session_hash = identity.token_hash(token["jti"])
+        except (jwt.PyJWTError, ValueError, KeyError, TypeError, AttributeError):
             raise Problem(401, "UNAUTHENTICATED", "Invalid or expired session.") from None
-        with connect(cfg["app_dsn"]) as c:
-            user = c.execute("SELECT * FROM users WHERE id=%s AND active", (user_id,)).fetchone()
+        user = c.execute(
+            """SELECT u.* FROM users u JOIN auth_sessions s ON s.user_id=u.id
+            WHERE u.id=%s AND u.active AND s.token_hash=%s AND s.revoked_at IS NULL
+            AND s.expires_at>clock_timestamp()""",
+            (user_id, session_hash),
+        ).fetchone()
         if not user:
             raise Problem(401, "UNAUTHENTICATED", "This account is inactive.")
         request.state.actor_id = user["id"]
+        request.state.session_hash = session_hash
         return user
+
+    def actor(request: Request, credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(Bearer)]):
+        with connect(cfg["app_dsn"]) as c:
+            return authenticate(c, request, credentials)
+
+    def workspace_context(
+        request: Request, credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(Bearer)]
+    ):
+        # One connection and one consistent snapshot for identity, ownership and money.
+        with connect(cfg["app_dsn"]) as c:
+            c.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            yield c, authenticate(c, request, credentials)
 
     Actor = Annotated[dict, Depends(actor)]
 
     def role(a, *roles):
         if a["role"] not in roles:
             raise Problem(403, "FORBIDDEN", "Your role cannot perform this action.")
+
+    from milestone.sandbox import register as register_sandbox
+
+    register_sandbox(app, cfg, actor, role, sandbox_bank)
 
     @app.get("/health", tags=["health"])
     def health():
@@ -73,27 +106,56 @@ def create_app(settings=None, *, after_command=None):
 
     @app.post("/api/v1/auth/token", tags=["identity"])
     def login(body: TokenRequest, request: Request):
+        identity.throttle(cfg, "login", body.login)
         with connect(cfg["app_dsn"]) as c:
-            u = c.execute("SELECT * FROM users WHERE login=%s AND active", (body.login,)).fetchone()
-        if not u or not verify_password(body.password, u["password_hash"]):
-            raise Problem(401, "UNAUTHENTICATED", "Invalid credentials.")
-        issued = now()
-        token = jwt.encode(
-            dict(
-                sub=str(u["id"]),
-                iat=issued,
-                exp=issued + timedelta(hours=1),
-                aud="milestone",
-                iss="milestone-local",
-            ),
-            cfg["jwt_secret"],
-            algorithm="HS256",
-        )
-        return dict(access_token=token, token_type="Bearer", expires_in=3600)
+            u = c.execute(
+                "SELECT * FROM users WHERE lower(btrim(login))=%s AND active", (body.login,)
+            ).fetchone()
+            valid = verify_password(body.password, u["password_hash"] if u else identity.DUMMY_HASH)
+            if not u or not valid:
+                raise Problem(401, "UNAUTHENTICATED", "Email or password is incorrect.")
+            return result(identity.issue_session(c, cfg, u))
+
+    @app.post("/api/v1/auth/register", tags=["identity"], status_code=201)
+    def register_account(body: RegistrationRequest, request: Request):
+        identity.throttle(cfg, "register", body.login)
+        secret_hash = hash_password(body.password)
+        with connect(cfg["app_dsn"]) as c:
+            uid = identifier()
+            try:
+                c.execute(
+                    "SELECT register_account(%s,%s,%s,%s,%s)",
+                    (uid, body.login, body.display_name, secret_hash, body.role),
+                )
+            except UniqueViolation:
+                raise Problem(
+                    409,
+                    "ACCOUNT_UNAVAILABLE",
+                    "This account could not be created. Try signing in or use a different email.",
+                ) from None
+            u = c.execute("SELECT * FROM users WHERE id=%s", (uid,)).fetchone()
+            audit(
+                c,
+                uid,
+                "ACCOUNT_CREATED",
+                None,
+                request.state.correlation,
+                "Personal prototype account created; funding and payout setup pending.",
+            )
+            return result(identity.issue_session(c, cfg, u), 201)
+
+    @app.post("/api/v1/auth/logout", tags=["identity"])
+    def logout(request: Request, a: Actor):
+        with connect(cfg["app_dsn"]) as c:
+            c.execute(
+                "UPDATE auth_sessions SET revoked_at=clock_timestamp() WHERE token_hash=%s AND user_id=%s",
+                (request.state.session_hash, a["id"]),
+            )
+        return result(dict(signed_out=True))
 
     @app.get("/api/v1/me", tags=["identity"])
     def me(a: Actor):
-        return result(dict(id=a["id"], display_name=a["display_name"], roles=[a["role"]]))
+        return result(identity.user_view(a))
 
     @app.get("/api/v1/projects", tags=["project"])
     def projects(a: Actor, limit: int = Query(25, ge=1, le=100), cursor: str | None = None):
@@ -108,6 +170,12 @@ def create_app(settings=None, *, after_command=None):
     def project(project_id: UUID, a: Actor):
         with connect(cfg["app_dsn"]) as c:
             return result(domain.project_view(c, domain.visible_project(c, a, project_id)))
+
+    @app.get("/api/v1/projects/{project_id}/workspace", tags=["project"])
+    def workspace(project_id: UUID, context=Depends(workspace_context)):
+        """Compact authoritative overview; full activity/ledger remain separate reads."""
+        c, a = context
+        return result(domain.workspace_view(c, a, domain.visible_project(c, a, project_id)))
 
     @app.get("/api/v1/wallets/me", tags=["project"])
     def wallet(a: Actor):

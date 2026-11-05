@@ -1,7 +1,8 @@
 from datetime import datetime
 from typing import Annotated, Literal
 from uuid import UUID
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+import re
 
 Version = Annotated[int, Field(strict=True, ge=1)]
 Text = Annotated[str, Field(min_length=1, max_length=2000)]
@@ -15,6 +16,36 @@ class Command(BaseModel):
 class TokenRequest(Command):
     login: Short
     password: Annotated[str, Field(min_length=1, max_length=256)]
+
+    @field_validator("login")
+    @classmethod
+    def normalize_login(cls, value):
+        return value.strip().lower()
+
+
+class RegistrationRequest(TokenRequest):
+    display_name: Annotated[str, Field(min_length=1, max_length=80)]
+    password: Annotated[str, Field(min_length=15, max_length=128)]
+    role: Literal["CLIENT", "FREELANCER"]
+
+    @field_validator("login")
+    @classmethod
+    def valid_email(cls, value):
+        if not re.fullmatch(
+            r"[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?\.[a-z]{2,63}", value
+        ):
+            raise ValueError("Enter a valid email address")
+        if value.endswith("@demo.local"):
+            raise ValueError("Reserved demo domain")
+        return value
+
+    @field_validator("display_name")
+    @classmethod
+    def clean_name(cls, value):
+        value = value.strip()
+        if not value or any(ord(char) < 32 for char in value):
+            raise ValueError("Enter your display name")
+        return value
 
 
 class AssessmentCommand(Command):

@@ -57,7 +57,81 @@ def project_view(c, p):
             "version",
             "agreement_id",
         ]
-    } | {"milestones": ms}
+    } | {
+        "milestones": ms,
+        "accepted_user_ids": [
+            row["user_id"]
+            for row in c.execute(
+                "SELECT user_id FROM agreement_acceptances WHERE agreement_id=%s", (p["agreement_id"],)
+            ).fetchall()
+        ],
+    }
+
+
+def workspace_view(c, actor, p):
+    """Participant-scoped overview, called inside a repeatable-read transaction."""
+    project = project_view(c, p)
+    submissions = c.execute(
+        """
+        SELECT DISTINCT ON (s.milestone_id) s.id,s.milestone_id,s.description,
+          s.evidence_ref AS evidence_reference,s.submitted_at,m.version AS milestone_version,
+          jsonb_build_object('id',w.id,'due_at',w.due_at,'status',w.state) AS review_window
+        FROM submissions s JOIN milestones m ON m.id=s.milestone_id
+        JOIN review_windows w ON w.submission_id=s.id
+        WHERE m.project_id=%s ORDER BY s.milestone_id,s.version DESC,w.opened_at DESC,w.id
+    """,
+        (p["id"],),
+    ).fetchall()
+    payouts = [
+        payout_view(row)
+        for row in c.execute(
+            """
+        SELECT p.* FROM payouts p JOIN milestones m ON m.id=p.milestone_id
+        WHERE m.project_id=%s ORDER BY p.authorised_at,p.id
+    """,
+            (p["id"],),
+        ).fetchall()
+    ]
+    disputes = c.execute(
+        """
+        SELECT d.id,d.milestone_id,d.stage,d.status,d.reason,d.opened_at,m.version AS milestone_version
+        FROM disputes d JOIN milestones m ON m.id=d.milestone_id
+        WHERE m.project_id=%s AND d.status='OPEN' ORDER BY d.opened_at DESC,d.id
+    """,
+        (p["id"],),
+    ).fetchall()
+    balances = c.execute(
+        """
+        SELECT l.account_kind, sum(CASE WHEN e.side='CREDIT' THEN e.amount_minor ELSE -e.amount_minor END) AS amount
+        FROM journal_entries e JOIN journal_batches b ON b.id=e.batch_id
+        JOIN ledger_accounts l ON l.id=e.account_id
+        WHERE b.project_id=%s AND l.account_kind IN ('RESERVED','PAYOUT_PAYABLE')
+        GROUP BY l.account_kind
+    """,
+        (p["id"],),
+    ).fetchall()
+    by_kind = {row["account_kind"]: int(row["amount"]) for row in balances}
+    notices = c.execute(
+        """
+        SELECT id,kind,text,created_at FROM notifications WHERE user_id=%s
+        ORDER BY created_at DESC,id LIMIT 8
+    """,
+        (actor["id"],),
+    ).fetchall()
+    return dict(
+        project=project,
+        submissions={str(s["milestone_id"]): s for s in submissions},
+        payouts=payouts,
+        disputes=disputes,
+        notices=notices,
+        amounts=dict(
+            reserved=by_kind.get("RESERVED", 0),
+            payable=by_kind.get("PAYOUT_PAYABLE", 0),
+            paid=sum(row["amount_minor"] for row in payouts if row["state"] == "SETTLED"),
+        ),
+        timeline=[],
+        ledger=[],
+    )
 
 
 def submission_view(c, s):
@@ -309,6 +383,8 @@ def dispute_view(c, row):
 def open_dispute(c, actor, p, m, body, corr):
     if actor["id"] not in (p["client_id"], p["freelancer_id"]):
         raise Problem(403, "FORBIDDEN", "Only a project participant may open a dispute.")
+    if p["status"] != "FUNDED":
+        conflict("The project must be funded before opening a milestone payment dispute.")
     if m["version"] != body.expected_version:
         conflict("Milestone state changed. Refresh before opening the case.")
     no_dispute(c, m)
