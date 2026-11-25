@@ -74,7 +74,8 @@ def create_app(settings=None, *, static_dir=None, batch=None):
 
     @app.middleware("http")
     async def public_headers(request: Request, call_next):
-        if request.method == "POST" and request.url.path in ("/api/v1/auth/token", "/__demo/session"):
+        # The demo route calls the token route internally, so counting only the token route avoids a duplicate database connection.
+        if request.method == "POST" and request.url.path == "/api/v1/auth/token":
             if not await run_in_threadpool(login_allowed, cfg):
                 return JSONResponse(
                     {"detail": "Demo sign-in is busy. Please try again in a minute."},

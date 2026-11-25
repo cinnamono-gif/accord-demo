@@ -1,1 +1,0 @@
-"""Synthetic milestone payment application."""
